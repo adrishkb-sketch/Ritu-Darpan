@@ -1,3 +1,3 @@
 print("Hello ISRO")
 
-print("we are cortex prime")
+print("This is from cortex prime")
