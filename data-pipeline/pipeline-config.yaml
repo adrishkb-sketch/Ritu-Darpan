@@ -1,0 +1,25 @@
+data_sources:
+  ground_imd:
+    rainfall: "https://www.imdpune.gov.in/cmpg/Griddata/Rainfall25Bin.html"
+    maxtemp: "https://www.imdpune.gov.in/cmpg/Griddata/Max1_Bin.html"
+    mintemp: "https://www.imdpune.gov.in/cmpg/Griddata/Min1_Bin.html"
+
+  satellite_insat:
+    lst: "https://www.mosdac.gov.in/3RIMGL2BLST"
+    sst: "https://www.mosdac.gov.in/3RIMGL2BSST"
+    rainfall: "https://www.mosdac.gov.in/3RIMGL2BIMC"
+
+paths:
+  # Using absolute paths or relative to script location is safer
+  raw_imd_dir: "raw/imd/"
+  raw_mosdac_dir: "raw/mosdac/"
+  processed_data_dir: "processed/"
+  output_file: "india_climate_master.csv"
+
+grid_settings:
+  # Standardizing everything to 0.25 deg to match IMD Rainfall baseline
+  resolution_deg: 0.25
+
+thresholds:
+  temp_zscore_limit: 3.0
+  rain_zscore_limit: 4.0
