@@ -9,7 +9,8 @@ def clean_pipeline(df, z_threshold=3):
     """
     print(f"Running cleaning pipeline with Z-score threshold: {z_threshold}...")
     
-    # Identify numeric columns for cleaning
+    # Ensure data is sorted by coordinates and time for proper temporal interpolation
+    df = df.sort_values(by=['lat', 'lon', 'datetime'])
     numeric_cols = df.select_dtypes(include=[np.number]).columns
     
     for col in numeric_cols:
@@ -26,9 +27,8 @@ def clean_pipeline(df, z_threshold=3):
         # Replace anomalies with NaN
         df.loc[z_scores > z_threshold, col] = np.nan
         
-        # 2. Gap Filling
-        # Interpolate missing values (linear interpolation)
-        df[col] = df[col].interpolate(method='linear', limit_direction='both')
+        # 2. Gap Filling (Fast vectorized forward/backward fill temporally for each grid point)
+        df[col] = df.groupby(['lat', 'lon'])[col].ffill().bfill()
         
         # Fill remaining NaNs if any (e.g., at edges) with mean
         if df[col].isna().any():

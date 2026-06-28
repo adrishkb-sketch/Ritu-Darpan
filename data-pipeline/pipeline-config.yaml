@@ -17,9 +17,27 @@ paths:
   output_file: "india_climate_master.csv"
 
 grid_settings:
-  # Standardizing everything to 0.25 deg to match IMD Rainfall baseline
-  resolution_deg: 0.25
+  # Resolution of target Digital Twin grid (0.05 deg = ~5 km)
+  resolution_deg: 0.05
+
+spatial_settings:
+  # Bounding Box coordinates for West Bengal (with a small buffer)
+  pilot_region: "West Bengal"
+  lat_min: 21.0
+  lat_max: 27.5
+  lon_min: 85.5
+  lon_max: 90.0
+
+temporal_settings:
+  start_year: 2021
+  end_year: 2023
 
 thresholds:
   temp_zscore_limit: 3.0
   rain_zscore_limit: 4.0
+
+cloudinary:
+  cloud_name: ""
+  api_key: ""
+  api_secret: ""
+

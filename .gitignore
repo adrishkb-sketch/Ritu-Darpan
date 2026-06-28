@@ -1,0 +1,21 @@
+# Data pipeline files (inputs and processed outputs)
+data-pipeline/raw/
+data-pipeline/processed/
+data-pipeline/scratch/
+
+# Python compiled outputs and caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ipynb_checkpoints/
+
+# OS-specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

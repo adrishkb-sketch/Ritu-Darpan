@@ -28,72 +28,117 @@ def connect_to_db(config):
     DB_URL = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
     return create_engine(DB_URL)
 
-def regrid_to_target(df, target_resolution=0.25):
+def regrid_variable(var_name, var_df, target_grid_coords, method='linear'):
     """
-    Standardizes different coordinate systems into a unified grid.
-    Uses nearest-neighbor interpolation to target resolution.
+    Interpolates a single variable's DataFrame to the target grid.
+    Performs interpolation day-by-day to maintain temporal index.
     """
-    print(f"Regridding data to {target_resolution} degree resolution...")
-    
-    if df.empty:
-        return df
-
-    # Create target grid
-    lat_min, lat_max = df['lat'].min(), df['lat'].max()
-    lon_min, lon_max = df['lon'].min(), df['lon'].max()
-    
-    grid_lat = np.arange(lat_min, lat_max, target_resolution)
-    grid_lon = np.arange(lon_min, lon_max, target_resolution)
-    grid_lon, grid_lat = np.meshgrid(grid_lon, grid_lat)
-    
-    # Identify value columns (excluding lat, lon, datetime, source)
-    value_cols = [c for c in df.columns if c not in ['lat', 'lon', 'datetime', 'source']]
-    
-    regridded_dfs = []
-    # Process each timestamp separately
-    for ts in df['datetime'].unique():
-        ts_df = df[df['datetime'] == ts]
+    print(f"Regridding variable '{var_name}' to target grid coordinates...")
+    if var_df.empty:
+        return pd.DataFrame()
         
-        points = ts_df[['lon', 'lat']].values
+    regridded_days = []
+    grid_points = target_grid_coords[['lon', 'lat']].values
+    
+    # Group by datetime to avoid O(N) scanning inside the loop
+    for dt, day_df in var_df.groupby('datetime'):
+        points = day_df[['lon', 'lat']].values
+        values = day_df[var_name].values
         
-        ts_regridded = pd.DataFrame({
-            'lon': grid_lon.flatten(),
-            'lat': grid_lat.flatten(),
-            'datetime': ts
-        })
-        
-        for col in value_cols:
-            values = ts_df[col].values
-            grid_values = griddata(points, values, (grid_lon, grid_lat), method='nearest')
-            ts_regridded[col] = grid_values.flatten()
+        # Check if we have enough points to interpolate
+        if len(points) < 4:
+            day_method = 'nearest'
+        else:
+            day_method = method
             
-        regridded_dfs.append(ts_regridded)
+        # Interpolate
+        grid_vals = griddata(points, values, grid_points, method=day_method)
         
-    return pd.concat(regridded_dfs, ignore_index=True)
+        # Fill edge boundary NaNs with nearest neighbor
+        if np.isnan(grid_vals).any():
+            nan_mask = np.isnan(grid_vals)
+            grid_vals_nearest = griddata(points, values, grid_points[nan_mask], method='nearest')
+            grid_vals[nan_mask] = grid_vals_nearest
+            
+        day_regridded = target_grid_coords.copy()
+        day_regridded['datetime'] = dt
+        day_regridded[var_name] = grid_vals
+        
+        regridded_days.append(day_regridded)
+        
+    if not regridded_days:
+        return pd.DataFrame()
+        
+    return pd.concat(regridded_days, ignore_index=True)
+
+def merge_regridded_datasets(datasets, config):
+    """
+    Regrids each variable separately and then horizontally merges them on datetime, lat, lon.
+    """
+    spatial = config['spatial_settings']
+    lat_min, lat_max = spatial['lat_min'], spatial['lat_max']
+    lon_min, lon_max = spatial['lon_min'], spatial['lon_max']
+    resolution = config['grid_settings']['resolution_deg']
+    
+    # Establish target grid coordinate lists
+    target_lats = np.arange(lat_min, lat_max, resolution)
+    target_lons = np.arange(lon_min, lon_max, resolution)
+    grid_lon, grid_lat = np.meshgrid(target_lons, target_lats)
+    
+    target_grid_coords = pd.DataFrame({
+        'lon': grid_lon.flatten(),
+        'lat': grid_lat.flatten()
+    })
+    
+    merged_df = None
+    
+    for var_name, var_df in datasets.items():
+        if var_df.empty:
+            continue
+        
+        # Regrid this variable
+        var_regridded = regrid_variable(var_name, var_df, target_grid_coords, method='linear')
+        if var_regridded.empty:
+            continue
+            
+        if merged_df is None:
+            merged_df = var_regridded
+        else:
+            # Merge horizontally
+            merged_df = pd.merge(merged_df, var_regridded, on=['datetime', 'lat', 'lon'], how='outer')
+            
+    if merged_df is not None:
+        merged_df['source'] = 'fused_twin'
+        
+    return merged_df
 
 def convert_to_spatial_dataframe(df):
-    """Converts standard lat/lon rows into PostGIS geometry strings."""
+    """Converts standard lat/lon rows into PostGIS geometry strings using vectorized operations."""
     print("Converting coordinates to PostGIS geometry points...")
-    # SRID 4326 represents standard WGS 84 GPS coordinates
-    df['geom'] = df.apply(lambda row: f"SRID=4326;POINT({row['lon']} {row['lat']})", axis=1)
+    # Vectorized string concatenation is 100x faster than df.apply(lambda)
+    df['geom'] = "SRID=4326;POINT(" + df['lon'].astype(str) + " " + df['lat'].astype(str) + ")"
     return df
 
 def main():
     # 1. Load Configurations
     config = load_config('pipeline-config.yaml')
     
-    # 2. Run Ingestion (Combines IMD and MOSDAC)
-    raw_master_df = build_master_grid(config)
-    if raw_master_df.empty:
+    # 2. Run Ingestion (Gets dictionary of DataFrames per variable)
+    datasets = build_master_grid(config)
+    if not datasets:
         print("Workflow stopped: No data ingested.")
         return
 
-    # 3. Align & Regrid Coordinates
-    aligned_df = regrid_to_target(raw_master_df, config['grid_settings']['resolution_deg'])
+    # 3. Align & Regrid Coordinates separately and horizontally merge
+    print("Regridding and fusing variables horizontally...")
+    fused_df = merge_regridded_datasets(datasets, config)
+    if fused_df is None or fused_df.empty:
+        print("Workflow stopped: Regridding failed.")
+        return
 
     # 4. Clean Gaps & Detect Anomalies
     z_limit = config.get('thresholds', {}).get('temp_zscore_limit', 3.0)
-    cleaned_df = clean_pipeline(aligned_df, z_limit)
+    cleaned_df = clean_pipeline(fused_df, z_limit)
 
     # 5. Extract Digital Twin Features
     processed_df = run_feature_engineering(cleaned_df)
@@ -129,4 +174,4 @@ def main():
     print("🎉 Pipeline run successful! Digital Twin data synchronized.")
 
 if __name__ == "__main__":
-    main()
+    main()
