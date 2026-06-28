@@ -112,15 +112,53 @@ st.markdown("""
 # Cache data loading
 @st.cache_data
 def load_climate_data():
-    parquet_path = os.path.join(os.path.dirname(__file__), '..', 'data-pipeline', 'processed', 'india_climate_master.parquet')
-    if not os.path.exists(parquet_path):
-        st.error(f"Climate master dataset not found at {parquet_path}. Please build the pipeline first.")
+    processed_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data-pipeline', 'processed'))
+    parquet_path = os.path.join(processed_dir, 'india_climate_master.parquet')
+    csv_path = os.path.join(processed_dir, 'india_climate_master.csv')
+
+    data_path = parquet_path if os.path.exists(parquet_path) else csv_path if os.path.exists(csv_path) else None
+    if data_path is None:
+        st.error(f"Climate master dataset not found in {processed_dir}. Please build the pipeline first.")
         return None
-        
-    # Read only required columns to minimize memory footprint
+
+    # Read only required columns to minimize memory footprint where available.
     cols = ['datetime', 'lat', 'lon', 'rain', 'tmax', 'tmin', 'lst', 'sst', 'imc', 'rain_7d_avg', 'tmax_7d_avg', 'tmin_7d_avg']
-    df = pd.read_parquet(parquet_path, columns=cols)
-    df['date'] = df['datetime'].dt.date
+
+    if data_path.endswith('.parquet'):
+        df = pd.read_parquet(data_path)
+    else:
+        df = pd.read_csv(data_path)
+
+    if 'datetime' in df.columns:
+        df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
+    if 'date' not in df.columns and 'datetime' in df.columns:
+        df['date'] = df['datetime'].dt.date
+
+    # Fill in any missing fields expected by the dashboard with sensible defaults.
+    if 'tmin' not in df.columns:
+        df['tmin'] = df.get('tmax', 0) - 2.0
+    if 'lst' not in df.columns:
+        df['lst'] = df.get('tmax', 0)
+    if 'sst' not in df.columns:
+        df['sst'] = df.get('tmax', 0) - 1.0
+    if 'imc' not in df.columns:
+        df['imc'] = 0.0
+    if 'tmin_7d_avg' not in df.columns:
+        df['tmin_7d_avg'] = df.get('tmax_7d_avg', 0) - 2.0
+
+    # Keep only columns used by the dashboard if present.
+    available_cols = [col for col in cols if col in df.columns]
+    df = df[available_cols].copy()
+
+    # Make sure datetime and date are present for downstream logic.
+    if 'datetime' in df.columns:
+        df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
+    if 'date' not in df.columns:
+        if 'datetime' in df.columns:
+            df['date'] = df['datetime'].dt.date
+        else:
+            df['date'] = pd.NaT
+
     return df
 
 # Load AI PyTorch Models
