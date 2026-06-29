@@ -10,6 +10,10 @@ except ImportError:
     WKTElement = None
 import yaml
 from scipy.interpolate import griddata
+import json
+from shapely.geometry import shape, Point
+from shapely.ops import unary_union
+from shapely.prepared import prep
 
 # Import functions from scripts module
 from scripts.ingest_raw import load_config, build_master_grid
@@ -128,20 +132,20 @@ def main():
     if not datasets:
         print("Workflow stopped: No data ingested.")
         return
-
+ 
     # 3. Align & Regrid Coordinates separately and horizontally merge
     print("Regridding and fusing variables horizontally...")
     fused_df = merge_regridded_datasets(datasets, config)
     if fused_df is None or fused_df.empty:
         print("Workflow stopped: Regridding failed.")
         return
-
+ 
     # 4. Clean Gaps & Detect Anomalies
     z_limit = config.get('thresholds', {}).get('temp_zscore_limit', 3.0)
     cleaned_df = clean_pipeline(fused_df, z_limit)
-
+ 
     # 5. Extract Digital Twin Features
-    processed_df = run_feature_engineering(cleaned_df)
+    processed_df = run_feature_engineering(cleaned_df, config)
 
     # 6. Format Data for PostGIS Spatial Database
     spatial_df = convert_to_spatial_dataframe(processed_df)

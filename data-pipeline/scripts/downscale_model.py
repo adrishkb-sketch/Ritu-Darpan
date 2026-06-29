@@ -9,13 +9,15 @@ import yaml
 from torch.utils.data import DataLoader, TensorDataset
 
 class DownscaleNet(nn.Module):
-    def __init__(self, input_dim=4, hidden_dim=64):
+    def __init__(self, input_dim=5, hidden_dim=64):
         super(DownscaleNet, self).__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(p=0.1),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(p=0.1),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1)
@@ -56,9 +58,9 @@ def train_downscaler():
     # This represents the coarse 1.0 degree IMD temperature reading
     df['tmax_coarse'] = df['tmax'] + np.random.normal(0, 1.2, size=df.shape[0])
     
-    # Feature columns: [tmax_coarse, lst, lat, lon]
+    # Feature columns: [tmax_coarse, lst, lat, lon, elevation]
     # Target column: [tmax]
-    X_data = df[['tmax_coarse', 'lst', 'lat', 'lon']].values
+    X_data = df[['tmax_coarse', 'lst', 'lat', 'lon', 'elevation']].values
     y_data = df[['tmax']].values
     
     # Convert to PyTorch Tensors
@@ -97,9 +99,9 @@ def train_downscaler():
     print(f"[SUCCESS] Downscaler model weights saved to {model_path}")
     return True
 
-def run_inference(coarse_temp, lst_temp, lats, lons):
+def run_inference(coarse_temp, lst_temp, lats, lons, elevations, mc_dropout=False):
     """
-    Runs real-time inference to downscale temperature.
+    Runs real-time inference to downscale temperature with optional Monte Carlo Dropout.
     Inputs can be scalars or numpy arrays.
     """
     cfg = load_config()
@@ -111,17 +113,22 @@ def run_inference(coarse_temp, lst_temp, lats, lons):
     
     model = DownscaleNet()
     if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path))
-    model.eval()
+        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+        
+    if mc_dropout:
+        model.train() # Enable dropout at test time
+    else:
+        model.eval()
     
     # Flatten inputs if they are arrays
     c_flat = np.array(coarse_temp).flatten()
     lst_flat = np.array(lst_temp).flatten()
     lat_flat = np.array(lats).flatten()
     lon_flat = np.array(lons).flatten()
+    elev_flat = np.array(elevations).flatten()
     
     # Create input feature matrix
-    features = np.column_stack([c_flat, lst_flat, lat_flat, lon_flat])
+    features = np.column_stack([c_flat, lst_flat, lat_flat, lon_flat, elev_flat])
     features_tensor = torch.tensor(features, dtype=torch.float32)
     
     with torch.no_grad():

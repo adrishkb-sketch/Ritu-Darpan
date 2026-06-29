@@ -9,6 +9,7 @@ import torch.nn as nn
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, date
+import json
 
 # Add data-pipeline to Python path for importing model classes
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data-pipeline')))
@@ -122,7 +123,7 @@ def load_climate_data():
         return None
 
     # Read only required columns to minimize memory footprint where available.
-    cols = ['datetime', 'lat', 'lon', 'rain', 'tmax', 'tmin', 'lst', 'sst', 'imc', 'rain_7d_avg', 'tmax_7d_avg', 'tmin_7d_avg']
+    cols = ['datetime', 'lat', 'lon', 'rain', 'tmax', 'tmin', 'lst', 'sst', 'imc', 'rain_7d_avg', 'tmax_7d_avg', 'tmin_7d_avg', 'elevation', 'tmax_grad_x', 'tmax_grad_y', 'rain_grad_x', 'rain_grad_y', 'tmax_spatial_mean', 'rain_spatial_mean']
 
     if data_path.endswith('.parquet'):
         df = pd.read_parquet(data_path)
@@ -182,9 +183,19 @@ def load_pytorch_models():
     
     return downscale_model, predict_model
 
+# Cache GeoJSON boundary loading
+@st.cache_data
+def load_geojson():
+    geojson_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data-pipeline', 'west-bengal.geojson'))
+    if os.path.exists(geojson_path):
+        with open(geojson_path, 'r') as f:
+            return json.load(f)
+    return None
+
 # Load resources
 df_raw = load_climate_data()
 downscale_model, predict_model = load_pytorch_models()
+geojson_data = load_geojson()
 
 # App layout
 if df_raw is not None:
@@ -237,18 +248,26 @@ if df_raw is not None:
     day_df['sim_rain_7d_avg'] = day_df['rain_7d_avg'] * (1 - rain_reduction_pct / 100.0)
     
     # Run PyTorch Downscaler Inference
-    # input features: [tmax_coarse, lst, lat, lon]
+    # input features: [tmax_coarse, lst, lat, lon, elevation]
     # We simulate a coarse input by adding minor noise to the baseline shifted tmax
     sim_tmax_coarse = day_df['sim_tmax'] + np.random.normal(0, 0.4, size=day_df.shape[0])
-    X_downscale = np.column_stack([sim_tmax_coarse, day_df['lst'], day_df['lat'], day_df['lon']])
+    X_downscale = np.column_stack([sim_tmax_coarse, day_df['lst'], day_df['lat'], day_df['lon'], day_df['elevation']])
     X_downscale_tensor = torch.tensor(X_downscale, dtype=torch.float32)
+    downscale_model.eval()
     with torch.no_grad():
         day_df['downscaled_tmax'] = downscale_model(X_downscale_tensor).numpy().flatten()
         
-    # Run PyTorch Predictor Inference (Forecast Tomorrow's values)
-    # input features: [rain_lag_1d, tmin_lag_1d, tmax, rain, lat, lon]
-    # We feed the simulated current conditions to predict tomorrow's shift
-    # Using 1-day lag values from current sim columns
+    # Re-calculate shifted spatial features based on what-if deltas
+    sim_rain_scale = (1 - rain_reduction_pct / 100.0)
+    day_df['sim_tmax_grad_x'] = day_df['tmax_grad_x']
+    day_df['sim_tmax_grad_y'] = day_df['tmax_grad_y']
+    day_df['sim_rain_grad_x'] = day_df['rain_grad_x'] * sim_rain_scale
+    day_df['sim_rain_grad_y'] = day_df['rain_grad_y'] * sim_rain_scale
+    day_df['sim_tmax_spatial_mean'] = day_df['tmax_spatial_mean'] + temp_delta
+    day_df['sim_rain_spatial_mean'] = day_df['rain_spatial_mean'] * sim_rain_scale
+
+    # Run PyTorch Predictor Inference (Forecast Tomorrow's values) using MC Dropout for UQ
+    # input features: [rain_lag_1d, tmin_lag_1d, tmax, rain, lat, lon, elevation, grad_x, grad_y, etc.]
     sim_rain_lag = day_df['sim_rain'] * 0.9  # simulated lag
     sim_tmin_lag = day_df['sim_tmin'] - 0.2  # simulated lag
     X_predict = np.column_stack([
@@ -257,13 +276,35 @@ if df_raw is not None:
         day_df['sim_tmax'],
         day_df['sim_rain'],
         day_df['lat'],
-        day_df['lon']
+        day_df['lon'],
+        day_df['elevation'],
+        day_df['sim_tmax_grad_x'],
+        day_df['sim_tmax_grad_y'],
+        day_df['sim_rain_grad_x'],
+        day_df['sim_rain_grad_y'],
+        day_df['sim_tmax_spatial_mean'],
+        day_df['sim_rain_spatial_mean']
     ])
     X_predict_tensor = torch.tensor(X_predict, dtype=torch.float32)
-    with torch.no_grad():
-        predictions = predict_model(X_predict_tensor).numpy()
-        day_df['forecast_rain'] = np.clip(predictions[:, 0], 0, None)
-        day_df['forecast_tmax'] = predictions[:, 1]
+    
+    # Run dynamic MC Dropout ensemble (N=15 runs)
+    ensemble_preds = []
+    predict_model.train() # Enable dropout layers during test-time forward passes
+    for _ in range(15):
+        with torch.no_grad():
+            preds = predict_model(X_predict_tensor).numpy()
+            ensemble_preds.append(preds)
+    ensemble_preds = np.array(ensemble_preds) # Shape: (15, num_points, 2)
+    
+    # Extract predictions and clip rain
+    rain_predictions = np.clip(ensemble_preds[:, :, 0], 0, None)
+    tmax_predictions = ensemble_preds[:, :, 1]
+    
+    # Compute mean and standard deviation (UQ bounds)
+    day_df['forecast_rain'] = rain_predictions.mean(axis=0)
+    day_df['forecast_tmax'] = tmax_predictions.mean(axis=0)
+    day_df['forecast_rain_std'] = rain_predictions.std(axis=0)
+    day_df['forecast_tmax_std'] = tmax_predictions.std(axis=0)
         
     # Recalculate Heatwave and Drought Risks based on simulation
     day_df['is_heatwave_risk'] = day_df['forecast_tmax'] > 40.0
@@ -275,6 +316,10 @@ if df_raw is not None:
     total_rain = day_df['sim_rain'].sum()
     heat_risk_pct = (day_df['is_heatwave_risk'].sum() / len(day_df)) * 100
     drought_risk_pct = (day_df['is_drought_risk'].sum() / len(day_df)) * 100
+    
+    # Uncertainty stats
+    avg_temp_uncertainty = day_df['forecast_tmax_std'].mean()
+    avg_rain_uncertainty = day_df['forecast_rain_std'].mean()
     
     # 3. Metric cards
     m1, m2, m3, m4 = st.columns(4)
@@ -301,7 +346,7 @@ if df_raw is not None:
             <div class="metric-label">🔥 Heatwave Grid Risk</div>
             <div class="metric-value" style="color: #e84393;">{heat_risk_pct:.1f}%</div>
             <span class="risk-badge {heat_status}">
-                {"HIGH RISK ALERT" if heat_risk_pct > 15 else "STABLE CONDITIONS"}
+                UQ Uncertainty: ±{avg_temp_uncertainty:.2f} °C
             </span>
         </div>
         """, unsafe_allow_html=True)
@@ -312,19 +357,37 @@ if df_raw is not None:
             <div class="metric-label">🌾 Agricultural Drought Risk</div>
             <div class="metric-value" style="color: #fdcb6e;">{drought_risk_pct:.1f}%</div>
             <span class="risk-badge {drought_status}">
-                {"CRITICAL DRYNESS" if drought_risk_pct > 40 else "NORMAL SOIL MOISTURE"}
+                UQ Uncertainty: ±{avg_rain_uncertainty:.2f} mm
             </span>
         </div>
         """, unsafe_allow_html=True)
         
     # Maps
     st.markdown("<h2 class='sub-glow'>Spatial Digital Twin Visualization</h2>", unsafe_allow_html=True)
-    tab1, tab2, tab3 = st.tabs(["🌎 AI Spatial Temperature Downscaling", "⛈️ Real-Time Rainfall Fusion", "🔮 AI Predictive Forecasting Map"])
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🌎 AI Spatial Temperature Downscaling", 
+        "⛈️ Real-Time Rainfall Fusion", 
+        "🔮 AI Predictive Forecasting Map",
+        "📊 AI Uncertainty Quantification (UQ)"
+    ])
     
     # Target Map Center coordinates for West Bengal
     wb_lat = 24.2
     wb_lon = 87.8
     zoom_level = 6.2
+    
+    # GeoJSON layer list helper
+    mapbox_layers_cfg = []
+    if geojson_data is not None:
+        mapbox_layers_cfg = [
+            {
+                "sourcetype": "geojson",
+                "source": geojson_data,
+                "type": "line",
+                "color": "#00f2fe",
+                "line": {"width": 1.5}
+            }
+        ]
     
     with tab1:
         st.write("AI-powered downscaling model mapping coarse temperatures to local high-resolution (0.05°) detail:")
@@ -343,7 +406,8 @@ if df_raw is not None:
         )
         fig_temp.update_layout(
             margin={"r":0,"t":0,"l":0,"b":0},
-            coloraxis_colorbar=dict(title="Temp (°C)", thickness=15, len=0.8)
+            coloraxis_colorbar=dict(title="Temp (°C)", thickness=15, len=0.8),
+            mapbox_layers=mapbox_layers_cfg
         )
         st.plotly_chart(fig_temp, use_container_width=True)
         
@@ -364,7 +428,8 @@ if df_raw is not None:
         )
         fig_rain.update_layout(
             margin={"r":0,"t":0,"l":0,"b":0},
-            coloraxis_colorbar=dict(title="Rain (mm)", thickness=15, len=0.8)
+            coloraxis_colorbar=dict(title="Rain (mm)", thickness=15, len=0.8),
+            mapbox_layers=mapbox_layers_cfg
         )
         st.plotly_chart(fig_rain, use_container_width=True)
         
@@ -385,9 +450,45 @@ if df_raw is not None:
         )
         fig_forecast.update_layout(
             margin={"r":0,"t":0,"l":0,"b":0},
-            coloraxis_colorbar=dict(title="Forecast (°C)", thickness=15, len=0.8)
+            coloraxis_colorbar=dict(title="Forecast (°C)", thickness=15, len=0.8),
+            mapbox_layers=mapbox_layers_cfg
         )
         st.plotly_chart(fig_forecast, use_container_width=True)
+
+    with tab4:
+        st.write("AI model prediction uncertainty (standard deviation) map computed via dynamic Monte Carlo Dropout runs:")
+        var_choice = st.radio("Choose Variable for Uncertainty Map:", ["Temperature Uncertainty", "Rainfall Uncertainty"])
+        
+        if var_choice == "Temperature Uncertainty":
+            color_var = "forecast_tmax_std"
+            color_scale = "Viridis"
+            range_val = [0.1, 2.5]
+            label_title = "Temp Uncertainty (°C)"
+        else:
+            color_var = "forecast_rain_std"
+            color_scale = "Plasma"
+            range_val = [0.1, 5.0]
+            label_title = "Rain Uncertainty (mm)"
+            
+        fig_uq = px.scatter_mapbox(
+            day_df,
+            lat="lat",
+            lon="lon",
+            color=color_var,
+            color_continuous_scale=color_scale,
+            range_color=range_val,
+            hover_data={"lat": True, "lon": True, color_var: ":.3f"},
+            mapbox_style="carto-darkmatter",
+            center={"lat": wb_lat, "lon": wb_lon},
+            zoom=zoom_level,
+            height=600
+        )
+        fig_uq.update_layout(
+            margin={"r":0,"t":0,"l":0,"b":0},
+            coloraxis_colorbar=dict(title=label_title, thickness=15, len=0.8),
+            mapbox_layers=mapbox_layers_cfg
+        )
+        st.plotly_chart(fig_uq, use_container_width=True)
         
     # Analysis graphs
     st.markdown("<h2 class='sub-glow'>Climatological Insights & Simulation Effects</h2>", unsafe_allow_html=True)

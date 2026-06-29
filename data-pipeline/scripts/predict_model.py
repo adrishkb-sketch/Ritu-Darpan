@@ -9,13 +9,15 @@ import yaml
 from torch.utils.data import DataLoader, TensorDataset
 
 class PredictNet(nn.Module):
-    def __init__(self, input_dim=6, hidden_dim=64):
+    def __init__(self, input_dim=13, hidden_dim=64):
         super(PredictNet, self).__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(p=0.1),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(p=0.1),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 2) # Outputs: [predicted_rain, predicted_tmax]
@@ -69,8 +71,8 @@ def train_predictor():
     # Drop rows with NaNs (which will be the last day of each coordinate)
     df_clean = df.dropna(subset=['target_rain', 'target_tmax'])
     
-    # Feature columns: [rain_lag_1d, tmin_lag_1d, tmax, rain, lat, lon]
-    X_cols = ['rain_lag_1d', 'tmin_lag_1d', 'tmax', 'rain', 'lat', 'lon']
+    # Feature columns: [rain_lag_1d, tmin_lag_1d, tmax, rain, lat, lon, elevation, tmax_grad_x, tmax_grad_y, rain_grad_x, rain_grad_y, tmax_spatial_mean, rain_spatial_mean]
+    X_cols = ['rain_lag_1d', 'tmin_lag_1d', 'tmax', 'rain', 'lat', 'lon', 'elevation', 'tmax_grad_x', 'tmax_grad_y', 'rain_grad_x', 'rain_grad_y', 'tmax_spatial_mean', 'rain_spatial_mean']
     X_data = df_clean[X_cols].values
     y_data = df_clean[['target_rain', 'target_tmax']].values
     
@@ -110,10 +112,10 @@ def train_predictor():
     print(f"[SUCCESS] Predictor model weights saved to {model_path}")
     return True
 
-def run_forecast(current_features):
+def run_forecast(current_features, mc_dropout=False):
     """
-    Inference function.
-    current_features: numpy array shape (N, 6) containing [rain_lag, tmin_lag, tmax, rain, lat, lon]
+    Inference function with optional Monte Carlo Dropout.
+    current_features: numpy array shape (N, 13) containing [rain_lag, tmin_lag, tmax, rain, lat, lon, elevation, grad_x, grad_y, etc.]
     Returns shape (N, 2) containing forecasted [rain, tmax] for the next day.
     """
     cfg = load_config()
@@ -125,8 +127,12 @@ def run_forecast(current_features):
     
     model = PredictNet()
     if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path))
-    model.eval()
+        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+        
+    if mc_dropout:
+        model.train() # Enable dropout at test time
+    else:
+        model.eval()
     
     features_tensor = torch.tensor(current_features, dtype=torch.float32)
     with torch.no_grad():
