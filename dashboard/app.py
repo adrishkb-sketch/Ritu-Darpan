@@ -118,6 +118,35 @@ def load_climate_data():
     parquet_path = os.path.join(processed_dir, 'india_climate_master.parquet')
     csv_path = os.path.join(processed_dir, 'india_climate_master.csv')
 
+    # If dataset doesn't exist, download it from public GitHub Release asset
+    if not os.path.exists(parquet_path) and not os.path.exists(csv_path):
+        os.makedirs(processed_dir, exist_ok=True)
+        url = "https://github.com/adrishkb-sketch/Ritu-Darpan/releases/download/v1.0.0/india_climate_master.parquet"
+        
+        st.warning("Climate master dataset not found locally. Downloading from public release asset (404 MB)... Please wait, this may take a minute.")
+        try:
+            import urllib.request
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            def reporthook(blocknum, blocksize, totalsize):
+                readsofar = blocknum * blocksize
+                if totalsize > 0:
+                    percent = min(readsofar / totalsize, 1.0)
+                    progress_bar.progress(percent)
+                    status_text.text(f"Downloaded {readsofar // (1024*1024)} MB of {totalsize // (1024*1024)} MB ({int(percent * 100)}%)")
+                else:
+                    status_text.text(f"Downloaded {readsofar // (1024*1024)} MB")
+            
+            urllib.request.urlretrieve(url, parquet_path, reporthook)
+            progress_bar.empty()
+            status_text.empty()
+            st.success("Download complete! Processing dataset...")
+        except Exception as e:
+            st.error(f"Failed to download dataset: {e}")
+            st.info("Ensure the dataset is uploaded to GitHub Releases as: v1.0.0/india_climate_master.parquet")
+            return None
+
     data_path = parquet_path if os.path.exists(parquet_path) else csv_path if os.path.exists(csv_path) else None
     if data_path is None:
         st.error(f"Climate master dataset not found in {processed_dir}. Please build the pipeline first.")
@@ -394,7 +423,10 @@ if df_raw is not None:
         "🌎 AI Spatial Temperature Downscaling", 
         "⛈️ Real-Time Rainfall Fusion", 
         "🔮 AI Predictive Forecasting Map",
-        "📊 AI Uncertainty Quantification (UQ)"
+        "📊 AI Uncertainty Quantification (UQ)",
+        "🎬 Playback (NEW)",
+        "🔍 Model Explainability (NEW)",
+        "🏗️ Scalable National Architecture (NEW)"
     ])
     
     # Target Map Center coordinates for West Bengal
@@ -574,7 +606,7 @@ if df_raw is not None:
         st.write("### National Scaling Architecture")
         st.write("The ISRO problem statement demands a **Scalable framework for national deployment**. This diagram outlines our production-ready cloud blueprint:")
         st.markdown(
-            \"\"\"
+            """
             <div style="background-color: #1e1e1e; padding: 20px; border-radius: 10px;">
                 <h4 style="color:#00f2fe">Production Deployment Topology</h4>
                 <ul style="color:#fff;">
@@ -585,8 +617,74 @@ if df_raw is not None:
                     <li><b>Dashboard:</b> React/Streamlit frontend containerized and globally edge-cached via Cloudflare.</li>
                 </ul>
             </div>
-            \"\"\", unsafe_allow_html=True
+            """, unsafe_allow_html=True
         )
+
+    # Sector Advisory Panel
+    st.markdown("<h2 class='sub-glow'>Climate-Sensitive Sector Advisories</h2>", unsafe_allow_html=True)
+    st.write("Dynamic actionable guidelines derived directly from AI Digital Twin forecast states & simulated anomalies:")
+    
+    col_agr, col_wat, col_dis = st.columns(3)
+    
+    with col_agr:
+        # Agriculture Advisory
+        if drought_risk_pct > 30.0 or rain_reduction_pct > 20.0:
+            agr_title = "🌾 Agriculture (High Risk)"
+            agr_border = "border: 1px solid rgba(239, 68, 68, 0.4);"
+            agr_bg = "rgba(239, 68, 68, 0.05)"
+            agr_text = "<b>CRITICAL: Soil moisture deficit detected.</b> High drought risk indicates potential Kharif/Rabi crop stress. Delay non-essential tillage, deploy micro-irrigation, and implement conservation mulching."
+        else:
+            agr_title = "🌾 Agriculture (Normal)"
+            agr_border = "border: 1px solid rgba(34, 197, 94, 0.3);"
+            agr_bg = "rgba(34, 197, 94, 0.05)"
+            agr_text = "<b>OPTIMAL: Seasonal moisture levels are stable.</b> Crop health predictions indicate standard crop growth. Continue normal crop calendar operations and scheduling."
+            
+        st.markdown(f"""
+        <div class="glass-card" style="{agr_border} background: {agr_bg}; min-height: 180px;">
+            <div style="font-size: 1.2rem; font-weight: 700; color: #ffffff; margin-bottom: 10px;">{agr_title}</div>
+            <div style="font-size: 0.9rem; color: #cbd5e1; line-height: 1.4;">{agr_text}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+    with col_wat:
+        # Water Resource Advisory
+        if drought_risk_pct > 40.0:
+            wat_title = "🚰 Water Resources (Deficit)"
+            wat_border = "border: 1px solid rgba(253, 203, 110, 0.4);"
+            wat_bg = "rgba(253, 203, 110, 0.05)"
+            wat_text = "<b>WARNING: Surface runoff recharge deficit.</b> Projected reservoir inflows are below baseline. Recommended action: Initiate regional water audits, limit industrial washing, and optimize canal lock schedules."
+        else:
+            wat_title = "🚰 Water Resources (Normal)"
+            wat_border = "border: 1px solid rgba(34, 197, 94, 0.3);"
+            wat_bg = "rgba(34, 197, 94, 0.05)"
+            wat_text = "<b>NORMAL: Hydrological flows within baseline.</b> Reservoir replenishment rates are stable. Runoff forecasts show normal supply capacity for municipal/agr sectors."
+            
+        st.markdown(f"""
+        <div class="glass-card" style="{wat_border} background: {wat_bg}; min-height: 180px;">
+            <div style="font-size: 1.2rem; font-weight: 700; color: #ffffff; margin-bottom: 10px;">{wat_title}</div>
+            <div style="font-size: 0.9rem; color: #cbd5e1; line-height: 1.4;">{wat_text}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+    with col_dis:
+        # Disaster Management Advisory
+        if heat_risk_pct > 15.0 or temp_delta > 1.5:
+            dis_title = "⚠️ Disaster Response (Red Alert)"
+            dis_border = "border: 1px solid rgba(239, 68, 68, 0.5);"
+            dis_bg = "rgba(239, 68, 68, 0.08)"
+            dis_text = "<b>CRITICAL: Heatwave alert trigger.</b> High temperature grid cell percentage has breached safety thresholds. Issue outdoor labor breaks (12 PM - 3 PM), prep heat shelters, and monitor grid load."
+        else:
+            dis_title = "⚠️ Disaster Response (Safe)"
+            dis_border = "border: 1px solid rgba(34, 197, 94, 0.3);"
+            dis_bg = "rgba(34, 197, 94, 0.05)"
+            dis_text = "<b>NORMAL: Standard safety profile.</b> Temperatures and convective indices are within green bands. Continue baseline atmospheric monitoring and standard municipal safety operations."
+            
+        st.markdown(f"""
+        <div class="glass-card" style="{dis_border} background: {dis_bg}; min-height: 180px;">
+            <div style="font-size: 1.2rem; font-weight: 700; color: #ffffff; margin-bottom: 10px;">{dis_title}</div>
+            <div style="font-size: 0.9rem; color: #cbd5e1; line-height: 1.4;">{dis_text}</div>
+        </div>
+        """, unsafe_allow_html=True)
 
     # Analysis graphs
     st.markdown("<h2 class='sub-glow'>Climatological Insights & Simulation Effects</h2>", unsafe_allow_html=True)

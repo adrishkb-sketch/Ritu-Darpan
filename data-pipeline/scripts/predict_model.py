@@ -8,23 +8,43 @@ import numpy as np
 import yaml
 from torch.utils.data import DataLoader, TensorDataset
 
+class ResidualBlock(nn.Module):
+    def __init__(self, dim, dropout=0.1):
+        super(ResidualBlock, self).__init__()
+        self.fc1 = nn.Linear(dim, dim)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(p=dropout)
+        self.fc2 = nn.Linear(dim, dim)
+        
+    def forward(self, x):
+        residual = x
+        out = self.fc1(x)
+        out = self.relu(out)
+        out = self.dropout(out)
+        out = self.fc2(out)
+        out = self.relu(out + residual)
+        return out
+
 class PredictNet(nn.Module):
     def __init__(self, input_dim=13, hidden_dim=64):
         super(PredictNet, self).__init__()
-        self.net = nn.Sequential(
+        self.input_layer = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(p=0.1),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(p=0.1),
+            nn.ReLU()
+        )
+        self.res_block1 = ResidualBlock(hidden_dim)
+        self.res_block2 = ResidualBlock(hidden_dim)
+        self.output_layer = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 2) # Outputs: [predicted_rain, predicted_tmax]
         )
         
     def forward(self, x):
-        return self.net(x)
+        out = self.input_layer(x)
+        out = self.res_block1(out)
+        out = self.res_block2(out)
+        return self.output_layer(out)
 
 def load_config(config_path='pipeline-config.yaml'):
     if not os.path.exists(config_path):
