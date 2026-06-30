@@ -152,13 +152,30 @@ def load_climate_data():
         st.error(f"Climate master dataset not found in {processed_dir}. Please build the pipeline first.")
         return None
 
-    # Read only required columns to minimize memory footprint where available.
+    # Read only required columns and apply a date filter to minimize memory footprint to fit in 1GB RAM on Streamlit Cloud.
     cols = ['datetime', 'lat', 'lon', 'rain', 'tmax', 'tmin', 'lst', 'sst', 'imc', 'rain_7d_avg', 'tmax_7d_avg', 'tmin_7d_avg', 'elevation', 'tmax_grad_x', 'tmax_grad_y', 'rain_grad_x', 'rain_grad_y', 'tmax_spatial_mean', 'rain_spatial_mean']
 
     if data_path.endswith('.parquet'):
-        df = pd.read_parquet(data_path)
+        import pyarrow.parquet as pq
+        try:
+            meta = pq.read_metadata(data_path)
+            file_cols = meta.schema.names
+            available_cols = [col for col in cols if col in file_cols]
+            # Read only post-2023 data to significantly reduce row counts and memory usage
+            df = pd.read_parquet(
+                data_path, 
+                columns=available_cols,
+                filters=[('datetime', '>=', pd.Timestamp('2023-01-01'))]
+            )
+        except Exception:
+            df = pd.read_parquet(data_path)
     else:
-        df = pd.read_csv(data_path)
+        try:
+            header = pd.read_csv(data_path, nrows=0)
+            available_cols = [col for col in cols if col in header.columns]
+            df = pd.read_csv(data_path, usecols=available_cols)
+        except Exception:
+            df = pd.read_csv(data_path)
 
     if 'datetime' in df.columns:
         df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
