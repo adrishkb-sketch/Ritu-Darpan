@@ -10,6 +10,12 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, date
 import json
+import pydeck as pdk
+import requests
+import io
+import google.generativeai as genai
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
 
 # Add data-pipeline to Python path for importing model classes
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data-pipeline')))
@@ -204,6 +210,13 @@ if df_raw is not None:
     st.sidebar.markdown("<h2 class='sub-glow'>Simulation Panel</h2>", unsafe_allow_html=True)
     st.sidebar.write("Configure what-if scenarios and dates below:")
     
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### ⚙️ Execution Mode")
+    execution_mode = st.sidebar.radio("Inference Engine", ["Local (PyTorch)", "Remote (FastAPI)"], help="Choose where to run the AI inference")
+    
+    st.sidebar.markdown("### 🤖 GenAI Configuration")
+    gemini_api_key = st.sidebar.text_input("Gemini API Key", type="password", help="Enter your Gemini API Key to enable the Climatology Chatbot.")
+    
     # Date slider
     unique_dates = sorted(df_raw['date'].unique())
     selected_date = st.sidebar.select_slider(
@@ -248,17 +261,8 @@ if df_raw is not None:
     day_df['sim_rain'] = day_df['rain'] * (1 - rain_reduction_pct / 100.0)
     day_df['sim_rain_7d_avg'] = day_df['rain_7d_avg'] * (1 - rain_reduction_pct / 100.0)
     
-    # Run PyTorch Downscaler Inference
-    # input features: [tmax_coarse, lst, lat, lon, elevation]
-    # We simulate a coarse input by adding minor noise to the baseline shifted tmax
+    # Prepare features for Downscaler & Predictor
     sim_tmax_coarse = day_df['sim_tmax'] + np.random.normal(0, 0.4, size=day_df.shape[0])
-    X_downscale = np.column_stack([sim_tmax_coarse, day_df['lst'], day_df['lat'], day_df['lon'], day_df['elevation']])
-    X_downscale_tensor = torch.tensor(X_downscale, dtype=torch.float32)
-    downscale_model.eval()
-    with torch.no_grad():
-        day_df['downscaled_tmax'] = downscale_model(X_downscale_tensor).numpy().flatten()
-        
-    # Re-calculate shifted spatial features based on what-if deltas
     sim_rain_scale = (1 - rain_reduction_pct / 100.0)
     day_df['sim_tmax_grad_x'] = day_df['tmax_grad_x']
     day_df['sim_tmax_grad_y'] = day_df['tmax_grad_y']
@@ -266,37 +270,54 @@ if df_raw is not None:
     day_df['sim_rain_grad_y'] = day_df['rain_grad_y'] * sim_rain_scale
     day_df['sim_tmax_spatial_mean'] = day_df['tmax_spatial_mean'] + temp_delta
     day_df['sim_rain_spatial_mean'] = day_df['rain_spatial_mean'] * sim_rain_scale
-
-    # Run PyTorch Predictor Inference (Forecast Tomorrow's values) using MC Dropout for UQ
-    # input features: [rain_lag_1d, tmin_lag_1d, tmax, rain, lat, lon, elevation, grad_x, grad_y, etc.]
-    sim_rain_lag = day_df['sim_rain'] * 0.9  # simulated lag
-    sim_tmin_lag = day_df['sim_tmin'] - 0.2  # simulated lag
+    sim_rain_lag = day_df['sim_rain'] * 0.9
+    sim_tmin_lag = day_df['sim_tmin'] - 0.2
+    
+    X_downscale = np.column_stack([sim_tmax_coarse, day_df['lst'], day_df['lat'], day_df['lon'], day_df['elevation']])
     X_predict = np.column_stack([
-        sim_rain_lag,
-        sim_tmin_lag,
-        day_df['sim_tmax'],
-        day_df['sim_rain'],
-        day_df['lat'],
-        day_df['lon'],
-        day_df['elevation'],
-        day_df['sim_tmax_grad_x'],
-        day_df['sim_tmax_grad_y'],
-        day_df['sim_rain_grad_x'],
-        day_df['sim_rain_grad_y'],
-        day_df['sim_tmax_spatial_mean'],
-        day_df['sim_rain_spatial_mean']
+        sim_rain_lag, sim_tmin_lag, day_df['sim_tmax'], day_df['sim_rain'],
+        day_df['lat'], day_df['lon'], day_df['elevation'], day_df['sim_tmax_grad_x'],
+        day_df['sim_tmax_grad_y'], day_df['sim_rain_grad_x'], day_df['sim_rain_grad_y'],
+        day_df['sim_tmax_spatial_mean'], day_df['sim_rain_spatial_mean']
     ])
-    X_predict_tensor = torch.tensor(X_predict, dtype=torch.float32)
     
-    # Run dynamic MC Dropout ensemble (N=15 runs)
-    ensemble_preds = []
-    predict_model.train() # Enable dropout layers during test-time forward passes
-    for _ in range(15):
+    # Execution MLOps Logic
+    inference_success = False
+    if execution_mode == "Remote (FastAPI)":
+        try:
+            req_data = {
+                "downscale_features": X_downscale.tolist(),
+                "predict_features": X_predict.tolist(),
+                "num_mc_runs": 15
+            }
+            with st.spinner('Running AI models via Remote API...'):
+                res = requests.post("http://127.0.0.1:8000/simulate", json=req_data, timeout=15)
+                if res.status_code == 200:
+                    out = res.json()
+                    day_df['downscaled_tmax'] = np.array(out['downscaled_tmax'])
+                    ensemble_preds = np.array(out['ensemble_preds'])
+                    inference_success = True
+                else:
+                    st.error("API Error. Falling back to local execution.")
+        except Exception as e:
+            st.warning(f"Failed to connect to API ({e}). Falling back to local PyTorch execution.")
+            
+    if not inference_success:
+        # Fallback Local Execution
+        X_downscale_tensor = torch.tensor(X_downscale, dtype=torch.float32)
+        downscale_model.eval()
         with torch.no_grad():
-            preds = predict_model(X_predict_tensor).numpy()
-            ensemble_preds.append(preds)
-    ensemble_preds = np.array(ensemble_preds) # Shape: (15, num_points, 2)
-    
+            day_df['downscaled_tmax'] = downscale_model(X_downscale_tensor).numpy().flatten()
+            
+        X_predict_tensor = torch.tensor(X_predict, dtype=torch.float32)
+        ensemble_preds = []
+        predict_model.train()
+        for _ in range(15):
+            with torch.no_grad():
+                preds = predict_model(X_predict_tensor).numpy()
+                ensemble_preds.append(preds)
+        ensemble_preds = np.array(ensemble_preds)
+        
     # Extract predictions and clip rain
     rain_predictions = np.clip(ensemble_preds[:, :, 0], 0, None)
     tmax_predictions = ensemble_preds[:, :, 1]
@@ -377,7 +398,38 @@ if df_raw is not None:
         """, unsafe_allow_html=True)
         
     # Actionable Alerts
-    st.markdown("<h2 class='sub-glow'>🚨 Actionable Intelligence Center</h2>", unsafe_allow_html=True)
+    col1, col2 = st.columns([0.8, 0.2])
+    with col1:
+        st.markdown("<h2 class='sub-glow'>🚨 Actionable Intelligence Center</h2>", unsafe_allow_html=True)
+    with col2:
+        def generate_pdf_report():
+            buffer = io.BytesIO()
+            p = canvas.Canvas(buffer, pagesize=letter)
+            p.drawString(100, 750, "Ritu-Darpan Climatology Report")
+            p.drawString(100, 730, f"Date: {selected_date.strftime('%Y-%b-%d')}")
+            p.drawString(100, 710, f"Avg Simulated Max Temp: {avg_temp:.2f} C")
+            p.drawString(100, 690, f"Total Rainfall: {total_rain:.1f} mm")
+            p.drawString(100, 670, f"Heatwave Grid Risk: {heat_risk_pct:.1f}%")
+            p.drawString(100, 650, f"Drought Grid Risk: {drought_risk_pct:.1f}%")
+            
+            y = 610
+            if critical_drought_points > 10:
+                p.drawString(100, y, f"ALERT: High probability of drought in {critical_drought_points} regions.")
+                y -= 20
+            if critical_heat_points > 10:
+                p.drawString(100, y, f"WARNING: Heatwave conditions in {critical_heat_points} zones.")
+            p.showPage()
+            p.save()
+            buffer.seek(0)
+            return buffer
+
+        pdf_buffer = generate_pdf_report()
+        st.download_button(
+            label="📄 Export PDF",
+            data=pdf_buffer,
+            file_name=f"ritu_darpan_report_{selected_date}.pdf",
+            mime="application/pdf"
+        )
     critical_drought_points = day_df[day_df['is_drought_risk']].shape[0]
     critical_heat_points = day_df[day_df['is_heatwave_risk']].shape[0]
     
@@ -390,11 +442,16 @@ if df_raw is not None:
         
     # Maps
     st.markdown("<h2 class='sub-glow'>Spatial Digital Twin Visualization</h2>", unsafe_allow_html=True)
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "🌎 AI Spatial Temperature Downscaling", 
         "⛈️ Real-Time Rainfall Fusion", 
         "🔮 AI Predictive Forecasting Map",
-        "📊 AI Uncertainty Quantification (UQ)"
+        "📊 AI Uncertainty Quantification (UQ)",
+        "⏳ Virtual Replica Playback",
+        "💡 Model Explainability (XAI)",
+        "⚙️ National Scaling Architecture",
+        "🗺️ 3D Terrain & Risk (PyDeck)",
+        "🤖 GenAI Chatbot"
     ])
     
     # Target Map Center coordinates for West Bengal
@@ -587,6 +644,71 @@ if df_raw is not None:
             </div>
             \"\"\", unsafe_allow_html=True
         )
+
+    with tab8:
+        st.write("### 3D AI Predictive Forecasting Map (PyDeck)")
+        st.write("GPU-accelerated rendering of Temperature (Color) and Rainfall (Elevation).")
+        
+        # Prepare data for PyDeck
+        pdk_data = day_df.copy()
+        # Scale for visualization
+        pdk_data['elevation_vis'] = pdk_data['sim_rain'] * 1500 
+        
+        # Define a PyDeck ColumnLayer
+        layer = pdk.Layer(
+            "ColumnLayer",
+            data=pdk_data,
+            get_position=["lon", "lat"],
+            get_elevation="elevation_vis",
+            elevation_scale=1,
+            radius=2000,
+            get_fill_color=["forecast_tmax * 5", 50, "255 - (forecast_tmax * 5)", 140],
+            pickable=True,
+            auto_highlight=True,
+        )
+        
+        # Set the viewport location
+        view_state = pdk.ViewState(
+            latitude=wb_lat,
+            longitude=wb_lon,
+            zoom=6.5,
+            pitch=45,
+            bearing=0
+        )
+        
+        # Render
+        r = pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip={"text": "Lat: {lat}, Lon: {lon}\\nForecast Temp: {forecast_tmax} °C\\nSim Rain: {sim_rain} mm"})
+        st.pydeck_chart(r)
+
+    with tab9:
+        st.write("### 🤖 GenAI Climatology Chatbot")
+        st.write("Ask questions about the current dashboard simulation. The AI will analyze the data on the screen.")
+        
+        if not gemini_api_key:
+            st.warning("⚠️ Please enter your Gemini API Key in the sidebar to enable the Chatbot.")
+        else:
+            genai.configure(api_key=gemini_api_key)
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            
+            chat_msg = st.chat_input("E.g., What are the riskiest zones for a heatwave today?")
+            if chat_msg:
+                st.chat_message("user").write(chat_msg)
+                with st.spinner("Analyzing data..."):
+                    try:
+                        # Feed the AI some context
+                        context = f\"\"\"
+                        Current Date: {selected_date}
+                        Avg Temp: {avg_temp:.2f} C
+                        Total Rainfall: {total_rain:.1f} mm
+                        Heatwave Risk: {heat_risk_pct:.1f}%
+                        Drought Risk: {drought_risk_pct:.1f}%
+                        Critical Drought Regions: {critical_drought_points}
+                        Critical Heat Regions: {critical_heat_points}
+                        \"\"\"
+                        response = model.generate_content(f"Context data:\\n{context}\\n\\nUser Question: {chat_msg}")
+                        st.chat_message("assistant").write(response.text)
+                    except Exception as e:
+                        st.error(f"Error communicating with Gemini: {e}")
 
     # Analysis graphs
     st.markdown("<h2 class='sub-glow'>Climatological Insights & Simulation Effects</h2>", unsafe_allow_html=True)

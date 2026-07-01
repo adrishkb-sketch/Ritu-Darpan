@@ -12,3 +12,9 @@ streamlit
 torch
 plotly
 sqlalchemy
+
+fastapi
+uvicorn
+pydeck
+reportlab
+google-generativeai
